@@ -1,0 +1,323 @@
+# Use the latest 2.1 version of CircleCI pipeline process engine.
+# See: https://circleci.com/docs/reference/configuration-reference
+version: 2.1
+
+# Reusable commands for Border0 network setup
+# Copy this entire commands section to reuse in your own CircleCI config
+commands:
+  setup-border0-network:
+    description: "Install Border0 CLI and start VPN node (requires machine executor)"
+    parameters:
+      border0-token:
+        type: string
+        default: ""
+        description: "Border0 authentication token (if not provided, will use OIDC exchange)"
+      border0-org-subdomain:
+        type: string
+        default: ""
+        description: "Border0 organization subdomain (used with OIDC)"
+      border0-svc-account-name:
+        type: string
+        default: ""
+        description: "Border0 service account name (used with OIDC)"
+      border0-token-duration-seconds:
+        type: integer
+        default: 3600
+        description: "Token duration in seconds (used with OIDC)"
+      vpn-wait-seconds:
+        type: integer
+        default: 5
+        description: "Seconds to wait for VPN connection to establish"
+      debug:
+        type: boolean
+        default: false
+        description: "Enable debug output (shows VPN peers and network diagnostics)"
+    steps:
+      - when:
+          condition:
+            and:
+              - equal: [ "", << parameters.border0-token >> ]
+          steps:
+            - run:
+                name: "Get OIDC token for Border0"
+                command: |
+                  set -euo pipefail
+
+                  AUD="api.border0.com"
+                  TOKEN="$(circleci run oidc get --claims "{\"aud\":\"${AUD}\"}")"
+
+                  # Export for use in subsequent steps
+                  echo "export BORDER0_OIDC_TOKEN=\"$TOKEN\"" >> $BASH_ENV
+
+                  echo "OIDC token retrieved successfully"
+            - run:
+                name: "Exchange OIDC token for Border0 token"
+                command: |
+                  set -euo pipefail
+
+                  # Make API call to exchange OIDC token
+                  RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+                    "https://api.border0.com/api/v1/auth/web_identity/exchange" \
+                    -H "Content-Type: application/json" \
+                    -H "Accept: application/json" \
+                    -d "{
+                      \"organization_subdomain\": \"<< parameters.border0-org-subdomain >>\",
+                      \"service_account_name\": \"<< parameters.border0-svc-account-name >>\",
+                      \"web_identity_token\": \"${BORDER0_OIDC_TOKEN}\",
+                      \"border0_token_duration_seconds\": << parameters.border0-token-duration-seconds >>
+                    }")
+
+                  # Extract HTTP status code and body
+                  HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+                  BODY=$(echo "$RESPONSE" | head -n-1)
+
+                  if [ "$HTTP_CODE" != "200" ]; then
+                    echo "Error: Token exchange failed with status $HTTP_CODE"
+                    echo "Response: $BODY"
+                    exit 1
+                  fi
+
+                  # Extract token from response
+                  BORDER0_TOKEN=$(echo "$BODY" | jq -r '.token')
+
+                  if [ -z "$BORDER0_TOKEN" ] || [ "$BORDER0_TOKEN" = "null" ]; then
+                    echo "Error: Token not found in response"
+                    exit 1
+                  fi
+
+                  # Export for use in subsequent steps
+                  echo "export BORDER0_TOKEN=\"$BORDER0_TOKEN\"" >> $BASH_ENV
+
+                  echo "Border0 token obtained successfully"
+      - when:
+          condition:
+            not:
+              equal: [ "", << parameters.border0-token >> ]
+          steps:
+            - run:
+                name: "Use provided Border0 token"
+                command: |
+                  echo "export BORDER0_TOKEN=\"<< parameters.border0-token >>\"" >> $BASH_ENV
+                  echo "Using provided Border0 token"
+      - run:
+          name: "Detect architecture and download Border0 CLI"
+          command: |
+            set -e
+
+            # Detect architecture
+            ARCH=$(uname -m)
+            case $ARCH in
+              x86_64)
+                DOWNLOAD_URL="https://download.border0.com/linux_amd64/border0"
+                ;;
+              aarch64|arm64)
+                DOWNLOAD_URL="https://download.border0.com/linux_arm64/border0"
+                ;;
+              armv7l|arm)
+                DOWNLOAD_URL="https://download.border0.com/linux_arm/border0"
+                ;;
+              *)
+                echo "Unsupported architecture: $ARCH"
+                exit 1
+                ;;
+            esac
+
+            echo "Downloading Border0 CLI from $DOWNLOAD_URL"
+            curl -L -o /tmp/border0 "$DOWNLOAD_URL"
+            chmod +x /tmp/border0
+            echo "Border0 CLI installed successfully"
+
+            # Verify installation
+            /tmp/border0 version || echo "Border0 CLI ready"
+      - run:
+          name: "Check and create TUN device"
+          command: |
+            set -e
+
+            echo "Checking for TUN/TAP device..."
+
+            # Check if /dev/net/tun exists
+            if [ ! -e /dev/net/tun ]; then
+              echo "/dev/net/tun does not exist, attempting to create it..."
+              sudo mkdir -p /dev/net
+              sudo mknod /dev/net/tun c 10 200
+              sudo chmod 666 /dev/net/tun
+              echo "/dev/net/tun created successfully"
+            else
+              echo "/dev/net/tun already exists"
+            fi
+
+            # Verify TUN module is loaded
+            if lsmod | grep -q tun; then
+              echo "TUN module is loaded"
+            else
+              echo "TUN module not loaded, attempting to load..."
+              sudo modprobe tun || echo "Could not load TUN module (may not be available)"
+            fi
+
+            ls -la /dev/net/tun || echo "/dev/net/tun still does not exist"
+      - run:
+          name: "Start Border0 VPN node"
+          command: |
+            set -e
+
+            # Create unique device name for this CircleCI run (max 50 chars)
+            # Format: cci-{workflow_id}-{org}-{repo}, trimmed to 50 chars
+            DEVICE_NAME_FULL="cci-${CIRCLE_WORKFLOW_ID}-${CIRCLE_PROJECT_USERNAME}-${CIRCLE_PROJECT_REPONAME}"
+            EPHEMERAL_DEVICE_NAME="${DEVICE_NAME_FULL:0:50}"
+
+            echo "Starting Border0 VPN node with sudo..."
+            nohup sudo /tmp/border0 node start --start-vpn --ephemeral --device-name "$EPHEMERAL_DEVICE_NAME" --token "$BORDER0_TOKEN" > /tmp/border0-node.log 2>&1 &
+            BORDER0_PID=$!
+
+            echo "export BORDER0_NODE_PID=$BORDER0_PID" >> $BASH_ENV
+            echo "Border0 VPN node started with PID: $BORDER0_PID"
+
+            # Wait a moment and check if process is still running
+            sleep 2
+            if ps -p $BORDER0_PID > /dev/null; then
+              echo "Border0 VPN node is running"
+              echo "Log file: /tmp/border0-node.log"
+            else
+              echo "Border0 VPN node failed to start"
+              cat /tmp/border0-node.log
+              exit 1
+            fi
+      - run:
+          name: "Save PID and create cleanup script"
+          command: |
+            # Save PID for cleanup
+            echo "$BORDER0_NODE_PID" > /tmp/border0-node.pid
+            echo "PID saved to /tmp/border0-node.pid"
+
+            # Create cleanup script
+            cat > /tmp/border0-cleanup.sh \<< 'EOF'
+            #!/bin/bash
+            # Cleanup script to stop Border0 VPN node
+            set -e
+
+            if [ -f /tmp/border0-node.pid ]; then
+              PID=$(cat /tmp/border0-node.pid)
+              echo "Stopping Border0 VPN node (PID: $PID)..."
+
+              if ps -p $PID > /dev/null 2>&1; then
+                sudo kill $PID 2>/dev/null || true
+                echo "Border0 VPN node stopped successfully"
+
+                # Wait for graceful shutdown
+                sleep 2
+
+                # Force kill if still running
+                if ps -p $PID > /dev/null 2>&1; then
+                  echo "Force killing Border0 VPN node..."
+                  sudo kill -9 $PID 2>/dev/null || true
+                fi
+              else
+                echo "Border0 VPN node process not found (already stopped)"
+              fi
+
+              rm -f /tmp/border0-node.pid
+            else
+              echo "No PID file found, nothing to clean up"
+            fi
+
+            # Show last few lines of log
+            if [ -f /tmp/border0-node.log ]; then
+              echo "Last 10 lines of Border0 node log:"
+              tail -n 10 /tmp/border0-node.log
+            fi
+            EOF
+
+            chmod +x /tmp/border0-cleanup.sh
+            echo "Cleanup script created at /tmp/border0-cleanup.sh"
+      - run:
+          name: "Wait for VPN connection"
+          command: |
+            echo "Waiting << parameters.vpn-wait-seconds >> seconds for VPN connection to establish..."
+            sleep << parameters.vpn-wait-seconds >>
+            echo "VPN connection ready"
+      - when:
+          condition: << parameters.debug >>
+          steps:
+            - run:
+                name: "Debug VPN peers and network diagnostics"
+                command: |
+                  echo "Debugging Border0 VPN peers..."
+
+                  # Install jq if not available
+                  if ! command -v jq &> /dev/null; then
+                    echo "Installing jq..."
+                    sudo apt-get update -qq && sudo apt-get install -y -qq jq
+                  fi
+
+                  /tmp/border0 node debug peers --json | jq || echo "Debug command failed"
+                  echo ""
+                  echo "=== Network Diagnostics ==="
+                  echo ""
+                  echo "Network interfaces:"
+                  ifconfig -a || ip addr show || echo "Could not list network interfaces"
+                  echo ""
+                  echo "Checking for utun/tun interfaces:"
+                  ifconfig -a | grep -E "utun|tun" || ip link show | grep -E "utun|tun" || echo "No utun/tun interfaces found"
+                  echo ""
+                  echo "Routing table:"
+                  netstat -rn || ip route || route -n || echo "Could not display routing table"
+                  echo ""
+                  echo "TUN device status:"
+                  ls -la /dev/net/tun || echo "/dev/net/tun does not exist"
+                  echo ""
+                  echo "Border0 node logs (last 50 lines):"
+                  tail -n 50 /tmp/border0-node.log || echo "No logs found"
+
+  cleanup-border0-network:
+    description: "Stop Border0 VPN node (always runs, even on failure)"
+    steps:
+      - run:
+          name: "Stop Border0 VPN"
+          when: always
+          command: bash /tmp/border0-cleanup.sh
+
+# Define a job to be invoked later in a workflow.
+# See: https://circleci.com/docs/guides/orchestrate/jobs-steps/#jobs-overview & https://circleci.com/docs/reference/configuration-reference/#jobs
+jobs:
+  say-hello:
+    # Use machine executor for TUN/TAP device support (required for VPN)
+    # Docker executor doesn't have the necessary privileges to create network devices
+    # See: https://circleci.com/docs/configuration-reference/#machine
+    machine:
+      image: ubuntu-2204:current
+
+    steps:
+      - checkout
+
+      # Setup Border0 network with OIDC authentication
+      - setup-border0-network:
+          border0-org-subdomain: "adriano-vpn"
+          border0-svc-account-name: "workflow-mgr"
+          border0-token-duration-seconds: 3600
+          vpn-wait-seconds: 5
+          debug: false
+
+      # Your application steps go here
+      - run:
+          name: "Install MySQL client"
+          command: |
+            sudo apt-get update
+            sudo apt-get install -y mysql-client
+
+      - run:
+          name: "Query MySQL database via Border0"
+          command: |
+            echo "Querying MySQL database at test-mysql-server..."
+            mysql -h test-mysql-server books -e "SELECT * FROM authors;"
+
+      # Cleanup Border0 network (always runs, even on failure)
+      - cleanup-border0-network
+
+# Orchestrate jobs using workflows
+# See: https://circleci.com/docs/guides/orchestrate/workflows/ & https://circleci.com/docs/reference/configuration-reference/#workflows
+workflows:
+  say-hello-workflow: # This is the name of the workflow, feel free to change it to better match your workflow.
+    # Inside the workflow, you define the jobs you want to run.
+    jobs:
+      - say-hello
