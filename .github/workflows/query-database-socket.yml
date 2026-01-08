@@ -4,19 +4,6 @@ name: Example Border0 Network Usage
 
 on:
   workflow_dispatch:
-    inputs:
-      border0-org-subdomain:
-        description: 'Border0 organization subdomain'
-        required: false
-        default: 'adriano-vpn'
-      border0-svc-account-name:
-        description: 'Border0 service account name'
-        required: false
-        default: 'github-actions'
-      border0-playground-db-socket:
-        description: 'Border0 playground database socket name'
-        required: false
-        default: 'test-mysql-server'
 
 jobs:
   run-example:
@@ -32,10 +19,9 @@ jobs:
         id: border0-vpn
         uses: borderzero/configure-border0-network@v0.0.2
         with:
-          border0-org-subdomain: ${{ github.event.inputs.border0-org-subdomain || 'adriano-vpn' }}
-          border0-svc-account-name: ${{ github.event.inputs.border0-svc-account-name || 'github-actions' }}
+          border0-org-subdomain: adriano-vpn
+          border0-svc-account-name: github-actions
           border0-token-duration-seconds: 900
-          debug: false
 
       - name: Install MySQL client
         run: |
@@ -44,8 +30,8 @@ jobs:
 
       - name: Query MySQL database via Border0
         run: |
-          echo "Querying MySQL database at ${{ github.event.inputs.border0-playground-db-socket || 'test-mysql-server' }}..."
-          mysql -h ${{ github.event.inputs.border0-playground-db-socket || 'test-mysql-server' }} -u dummy --password= books -e "SELECT * FROM authors;"
+          echo "Querying MySQL database at test-mysql-server..."
+          mysql -h test-mysql-server -u dummy --password= books -e "SELECT * FROM authors;"
 
       - name: Stop Border0 VPN
         if: always()
