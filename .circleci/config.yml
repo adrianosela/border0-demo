@@ -19,6 +19,57 @@ jobs:
       # Checkout the code as the first step.
       - checkout
       - run:
+          name: "Get OIDC token for Border0"
+          command: |
+            set -euo pipefail
+
+            AUD="api.border0.com"
+            TOKEN="$(circleci run oidc get --claims "{\"aud\":\"${AUD}\"}")"
+
+            # Export for use in subsequent steps
+            echo "export BORDER0_OIDC_TOKEN=\"$TOKEN\"" >> $BASH_ENV
+
+            echo "OIDC token retrieved successfully"
+      - run:
+          name: "Exchange OIDC token for Border0 token"
+          command: |
+            set -euo pipefail
+
+            # Make API call to exchange OIDC token
+            RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+              "https://api.border0.com/api/v1/auth/web_identity/exchange" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json" \
+              -d "{
+                \"organization_subdomain\": \"adriano-vpn\",
+                \"service_account_name\": \"workflow-mgr\",
+                \"web_identity_token\": \"${BORDER0_OIDC_TOKEN}\",
+                \"border0_token_duration_seconds\": 3600
+              }")
+
+            # Extract HTTP status code and body
+            HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+            BODY=$(echo "$RESPONSE" | head -n-1)
+
+            if [ "$HTTP_CODE" != "200" ]; then
+              echo "Error: Token exchange failed with status $HTTP_CODE"
+              echo "Response: $BODY"
+              exit 1
+            fi
+
+            # Extract token from response
+            BORDER0_TOKEN=$(echo "$BODY" | jq -r '.token')
+
+            if [ -z "$BORDER0_TOKEN" ] || [ "$BORDER0_TOKEN" = "null" ]; then
+              echo "Error: Token not found in response"
+              exit 1
+            fi
+
+            # Export for use in subsequent steps
+            echo "export BORDER0_TOKEN=\"$BORDER0_TOKEN\"" >> $BASH_ENV
+
+            echo "Border0 token obtained successfully"
+      - run:
           name: "Say hello"
           command: "echo Hello, World!"
 
